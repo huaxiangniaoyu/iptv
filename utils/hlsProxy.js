@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { Readable, Transform } from "node:stream";
 import { printRed, printYellow } from "./colorOut.js";
-import { proxyAwareFetch } from "./systemProxy.js";
+import { directFamilyFetch, proxyAwareFetch } from "./systemProxy.js";
 
 /**
  * 全代理模式（issue #98 续）：清单里的地址全部改写成「本机同源相对地址」，分片由服务器转发。
@@ -52,6 +52,10 @@ function markManifestResult(key, ok, now = Date.now()) {
 const TTL_MS = 10 * 60 * 1000     // 滑动空闲 TTL：活跃请求续期，停播 10 分钟后回收
 const MAX_ENTRIES = 5000          // 一个直播频道 10 分钟约 100 条，这个上限够几十路同放，超出按最早登记淘汰
 
+// Finite playlists are read once: later segments must survive while that VOD
+// session is active, even when the player never reloads its manifest.
+const vodSessions = new Map()
+const activeVod = (entry, now) => (vodSessions.get(entry.pid) || 0) > now
 const registry = new Map()        // key -> { url, pid, transform, upstreamHeaders, upstreamUrlTransform, expires }
 
 // 已知的媒体后缀：保留原后缀，按后缀识别流格式的播放器（极影视）才认得出分片
@@ -59,9 +63,11 @@ const KNOWN_EXT = new Set(['ts', 'm3u8', 'aac', 'mp3', 'mp4', 'm4s', 'm4a', 'vtt
 
 function extOf(url, fallback) {
   try {
-    const name = new URL(url).pathname.split('/').pop() || ''
+    const u = new URL(url)
+    const name = u.pathname.split('/').pop() || ''
     const dot = name.lastIndexOf('.')
     const ext = dot === -1 ? '' : name.slice(dot + 1).toLowerCase()
+    if (ext === 'webvtt') return 'vtt'
     return KNOWN_EXT.has(ext) ? ext : fallback
   } catch {
     return fallback
@@ -71,8 +77,9 @@ function extOf(url, fallback) {
 function sweep() {
   const now = Date.now()
   for (const [key, entry] of registry) {
-    if (entry.expires <= now) registry.delete(key)
+    if (entry.expires <= now && !activeVod(entry, now)) registry.delete(key)
   }
+  for (const [pid, expires] of vodSessions) if (expires <= now) vodSessions.delete(pid)
   // 扫完仍超上限：Map 迭代序即插入序，从最早的开始丢
   while (registry.size > MAX_ENTRIES) {
     const oldest = registry.keys().next()
@@ -82,12 +89,13 @@ function sweep() {
 }
 
 /**
- * 登记一条上游地址，返回稳定的短 key（同一地址永远同一 key，清单每 6 秒刷新一次也不会撑爆表）。
+ * 登记一条上游地址，返回稳定的短 key（同一频道、地址和网络族重复登记得到同一 key。共享 CDN 地址的频道各自保留请求上下文）。
  * key 前缀固定为 s：让分片路径 /proxy/s<hex>.ts 与频道清单路径 /proxy/<纯数字频道号>.m3u8
  * 在词法上永不相交，两条路由怎么排都不会互相误吃。
  */
-function register(url, pid = '', transform, upstreamHeaders, upstreamUrlTransform) {
-  const key = 's' + createHash('md5').update(url).digest('hex').slice(0, 16)
+function register(url, pid = '', transform, upstreamHeaders, upstreamUrlTransform, upstreamFamily) {
+  const family = upstreamFamily === 4 || upstreamFamily === 6 ? upstreamFamily : undefined
+  const key = 's' + createHash('md5').update(JSON.stringify([pid, family, url])).digest('hex').slice(0, 16)
   const targetUrl = upstreamUrlTransform ? upstreamUrlTransform(url) : url
   // 先删再插：Map 的 set 覆盖不改变迭代位置，重复登记（清单每 6 秒刷新）会让最活跃
   // 频道的 key 恒在队首，超上限淘汰时反而最先被丢。删后重插把迭代序变成「最近登记在尾」
@@ -98,6 +106,7 @@ function register(url, pid = '', transform, upstreamHeaders, upstreamUrlTransfor
     transform,
     upstreamHeaders,
     upstreamUrlTransform,
+    upstreamFamily: family,
     expires: Date.now() + TTL_MS,
   })
   if (registry.size > MAX_ENTRIES) sweep()
@@ -109,12 +118,13 @@ function lookup(key) {
   const entry = registry.get(key)
   if (!entry) return null
   const now = Date.now()
-  if (entry.expires <= now) {
+  if (entry.expires <= now && !activeVod(entry, now)) {
     registry.delete(key)
     return null
   }
   // master 里的子清单只在首次改写时登记，播放器随后会直接轮询该子清单；若 lookup 不续期，
   // 正常播放也会在固定 10 分钟后变成 404。删后重插同时把活跃项移到 LRU 队尾。
+  if (activeVod(entry, now)) vodSessions.set(entry.pid, now + TTL_MS)
   entry.expires = now + TTL_MS
   registry.delete(key)
   registry.set(key, entry)
@@ -122,6 +132,7 @@ function lookup(key) {
   if (entry.transform) result.transform = entry.transform
   if (entry.upstreamHeaders) result.upstreamHeaders = entry.upstreamHeaders
   if (entry.upstreamUrlTransform) result.upstreamUrlTransform = entry.upstreamUrlTransform
+  if (entry.upstreamFamily) result.upstreamFamily = entry.upstreamFamily
   return result
 }
 
@@ -140,25 +151,39 @@ function registrySize() {
  *
  * 纯字符串处理（除登记地址表外无副作用），便于单测。
  */
-function toProxyManifest(text, pid = '', transform, upstreamHeaders, upstreamUrlTransform) {
+function toProxyManifest(text, pid = '', transform, upstreamHeaders, upstreamUrlTransform, upstreamFamily, referencePrefix = '') {
+  if (pid && /^#EXT-X-ENDLIST\s*$/m.test(text)) {
+    for (const [key, expires] of vodSessions) if (expires <= Date.now()) vodSessions.delete(key)
+    if (vodSessions.size >= MAX_ENTRIES && !vodSessions.has(pid)) vodSessions.delete(vodSessions.keys().next().value)
+    vodSessions.set(pid, Date.now() + TTL_MS)
+  }
   const toRef = (uri, fallbackExt) => {
     if (!/^https?:\/\//i.test(uri)) return null   // 非绝对地址说明上一步改写没覆盖到，保持原样别弄坏
     try {
-      return `${register(uri, pid, transform, upstreamHeaders, upstreamUrlTransform)}.${extOf(uri, fallbackExt)}`
+      return `${referencePrefix}${register(uri, pid, transform, upstreamHeaders, upstreamUrlTransform, upstreamFamily)}.${extOf(uri, fallbackExt)}`
     } catch {
       return null
     }
   }
+  // 后缀决定走哪条路由：.m3u8 进嵌套子清单分支（取回后继续改写），其余原样透传。
+  // 子清单地址常常不带后缀（issue #235：cdn.qd.je 的 master 指向 https://cdn6.cc.cd/163189/ch8），
+  // 只看地址会被当成 .ts 透传，里面的 /api/... 根路径就落到本机、撞上后台鉴权回 403。
+  // 所以按 HLS 语义补后缀：#EXT-X-STREAM-INF 下一行、EXT-X-MEDIA / I 帧 / 缩略图清单的 URI= 都是清单
+  let nextIsPlaylist = false
   return text.split('\n').map(line => {
     const t = line.trim()
     if (!t) return line
     if (t.startsWith('#')) {
+      if (t.startsWith('#EXT-X-STREAM-INF')) nextIsPlaylist = true
+      const attrFallback = /^#EXT-X-(?:MEDIA|I-FRAME-STREAM-INF|IMAGE-STREAM-INF):/.test(t) ? 'm3u8' : 'key'
       return line.replace(/URI="([^"]*)"/g, (whole, uri) => {
-        const ref = toRef(uri, 'key')
+        const ref = toRef(uri, attrFallback)
         return ref ? `URI="${ref}"` : whole
       })
     }
-    return toRef(t, 'ts') || line
+    const fallback = nextIsPlaylist ? 'm3u8' : 'ts'
+    nextIsPlaylist = false
+    return toRef(t, fallback) || line
   }).join('\n')
 }
 
@@ -176,9 +201,9 @@ function toProxyManifest(text, pid = '', transform, upstreamHeaders, upstreamUrl
  * 码率或流格式。真遇到某个平台因 UA 取流异常，就针对那一个模块改并实测，不要整体翻。
  *
  * 唯一的例外是**函数形态**的 upstreamHeaders：它本就是模块按每一跳目标精确决定请求头的契约，
- * 它返回的 User-Agent 会原样发出。目前只有安徽视讯用到——该 CDN 按播放器标识放行，App 的
- * ijkplayer 与这个 Chrome UA 都能过，VLC / AppleCoreMedia / ExoPlayer 等一律 403，走 App 自己
- * 验证过的标识最稳。加这条例外时其余函数形态模块都没有声明 UA，它们的行为不变。
+ * 它返回的 User-Agent 会原样发出，让模块按 CDN 当前规则选择兼容标识。安徽视讯的旧
+ * live 域名使用 Chrome UA，2026-10-25 切换的 seclive 域名则使用 ijkplayer。
+ * 加这条例外时其余函数形态模块都没有声明 UA，它们的行为不变。
  */
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 
@@ -216,7 +241,10 @@ async function fetchUpstreamResponse(raw, {
   method = 'GET',
   signal,
   upstreamHeaders,
+  upstreamFamily,
   headers = {},
+  // 模块指定的出站 fetch（YouTube、澳门、海外频道走后台「网络代理」）；不给就按原来的系统代理 / 直连
+  fetchImpl: moduleFetch,
 } = {}) {
   let url = String(raw)
   const initialOrigin = new URL(url).origin
@@ -234,7 +262,10 @@ async function fetchUpstreamResponse(raw, {
         if (['authorization', 'cookie', 'proxy-authorization'].includes(name.toLowerCase())) delete generatedHeaders[name]
       }
     }
-    const response = await proxyAwareFetch(target.href, {
+    const fetchImpl = upstreamFamily === 4 || upstreamFamily === 6
+      ? (url, options) => directFamilyFetch(url, options, upstreamFamily)
+      : (moduleFetch || proxyAwareFetch)
+    const response = await fetchImpl(target.href, {
       method,
       redirect: 'manual',
       signal,
@@ -288,7 +319,7 @@ function logPipeFail(msg) {
  * 不缓冲整片：分片几百 KB 到几 MB，直播长跑时缓冲会顶着内存跑；直接 pipe 过去。
  * 客户端切台 / 关闭连接时中止上游请求，否则一次切台会留下一串还在下载的孤儿请求。
  */
-async function pipeUpstream(url, req, res, transform, upstreamHeaders = {}) {
+async function pipeUpstream(url, req, res, transform, upstreamHeaders = {}, upstreamFamily, fetchMedia = fetchUpstreamResponse) {
   const ctrl = new AbortController()
   const onClose = () => ctrl.abort()
   res.on('close', onClose)
@@ -299,7 +330,7 @@ async function pipeUpstream(url, req, res, transform, upstreamHeaders = {}) {
   try {
     // 要做整片变换时不能把 Range 片段单独交给解码器；回完整 200 对播放器仍合法。
     const headers = !transform && req.headers.range ? { range: req.headers.range } : {}
-    const upstream = await fetchUpstreamResponse(url, { signal: ctrl.signal, upstreamHeaders, headers })
+    const upstream = await fetchMedia(url, { signal: ctrl.signal, upstreamHeaders, upstreamFamily, headers })
     upstreamStatus = upstream.status
     clearTimeout(timer)
     if (!upstream.ok) logPipeFail(`分片上游回 ${upstream.status}: ${new URL(url).host}`)
@@ -350,7 +381,9 @@ async function pipeUpstream(url, req, res, transform, upstreamHeaders = {}) {
     if (!res.headersSent) {
       try { res.writeHead(502, { 'Content-Type': 'text/plain;charset=UTF-8' }); res.end('上游分片获取失败') } catch { /* 连接可能已断 */ }
     } else {
-      try { res.end() } catch { /* 连接可能已断 */ }
+      // 已经转发了部分正文，不能再正常结束 chunked 200：播放器会把半个 TS 当成完整
+      // 分片交给解码器，可能报不可恢复的媒体错误。中断连接，让它按下载失败重试。
+      try { res.destroy(error) } catch { /* 连接可能已断 */ }
     }
     return { ok: false, status: upstreamStatus || (res.headersSent ? res.statusCode : 502), bytes, complete: false, error: error?.message || String(error) }
   } finally {
@@ -365,7 +398,7 @@ async function pipeUpstream(url, req, res, transform, upstreamHeaders = {}) {
  * 直接访问咪咕 CDN 时拿到的响应一致。需要 segmentTransform 的平台不能照搬上游长度，
  * 因此保留旧的合成 200。上游不支持 HEAD 或临时失败时同样回退合成响应，不破坏原有 GET。
  */
-async function probeUpstream(url, req, res, transform, upstreamHeaders = {}) {
+async function probeUpstream(url, req, res, transform, upstreamHeaders = {}, upstreamFamily, fetchMedia = fetchUpstreamResponse) {
   const synthetic = (reason) => {
     res.writeHead(200, {
       'Content-Type': fallbackType(req.url || url),
@@ -387,10 +420,11 @@ async function probeUpstream(url, req, res, transform, upstreamHeaders = {}) {
   const timer = setTimeout(() => ctrl.abort(), 10000)
   try {
     const headers = req.headers.range ? { range: req.headers.range } : {}
-    const upstream = await fetchUpstreamResponse(url, {
+    const upstream = await fetchMedia(url, {
       method: 'HEAD',
       signal: ctrl.signal,
       upstreamHeaders,
+      upstreamFamily,
       headers,
     })
     clearTimeout(timer)
@@ -426,13 +460,14 @@ async function probeUpstream(url, req, res, transform, upstreamHeaders = {}) {
 }
 
 /** 取回一份嵌套子清单（全代理模式下清单里再出现 .m3u8 时用），返回 { text, finalUrl } 或 null */
-async function fetchNested(url, upstreamHeaders = {}) {
+async function fetchNested(url, upstreamHeaders = {}, upstreamFamily, fetchMedia = fetchUpstreamResponse) {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), 10000)
   try {
-    const resp = await fetchUpstreamResponse(url, {
+    const resp = await fetchMedia(url, {
       signal: ctrl.signal,
       upstreamHeaders,
+      upstreamFamily,
     })
     if (!resp.ok) return null
     const text = await resp.text()

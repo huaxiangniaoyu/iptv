@@ -16,7 +16,8 @@
  * 缓存放在模块里而不是外壳里：它缓存的 content 是咪咕的响应体（登录态信息由此
  * 而来），3 小时也是签名有效期这个平台属性，不是通用的 HTTP 缓存策略。
  */
-import { get302URL, getAndroidURL, getAndroidURL720p, printStreamInfo } from "./androidURL.js"
+import { cleanAccount, get302URL, getAndroidURL, getAndroidURL720p, printStreamInfo, sendsAccount } from "./androidURL.js"
+import { noteAuth } from "./account.js"
 import { printDebug } from "../../utils/colorOut.js"
 
 // 键是裸 pid。过期条目只是不命中、不回收——这是搬家前的行为，不加 LRU/上限，
@@ -35,10 +36,20 @@ const RID_HINTS = {
   COPYRIGHT_SHIELD_INVALID: "（咪咕版权屏蔽：当前节目在咪咕没有版权，通常节目结束后自动恢复，可先切到其他源的同名频道）",
 }
 
+// 游客被拒（rid=TIPS_NEED_LOGIN）：咪咕原话只有「由于版权原因，请登录后观看」，没说去哪登录，
+// 播放器上看到的又只是「不是视频数据」。2026-11-14 游客逐台实测 127 台，只有 CHC动作电影、
+// CHC家庭影院两台如此，回应里都标着 tip=VIP、fee=1；作者的会员账号能看，免费账号没测过，
+// 所以只说「会员账号可看」，不替免费账号打包票。
+function loginHint(content) {
+  if (content?.rid !== "TIPS_NEED_LOGIN") return ""
+  const vip = content?.body?.content?.tip?.code === "VIP"
+  return `（游客看不了这个频道：到后台「源管理 → 咪咕视频」填上咪咕账号${vip ? "；这是咪咕的 VIP 频道，会员账号可看" : ""}）`
+}
+
 /** 拿不到地址时的原因。desc 既进日志也是响应正文，新取与缓存命中两条路必须一致。 */
 export function failDesc(pid, content) {
   const msg = content != null ? content.message : "节目调整，暂不提供服务"
-  return `${pid} ${msg}${RID_HINTS[content?.rid] || ""}`
+  return `${pid} ${msg}${RID_HINTS[content?.rid] || loginHint(content)}`
 }
 
 /** 读缓存。命中返回 { url, desc }，未命中返回 null。 */
@@ -64,14 +75,15 @@ function readCache(pid) {
  */
 export async function resolve(ref, ctx = {}) {
   const pid = ref
-  const userId = ctx.account?.userId ?? ""
-  const token = ctx.account?.token ?? ""
+  const { userId, token } = cleanAccount(ctx.account?.userId, ctx.account?.token)
   // 画质参数来自模块自己的 configSchema（经 extractorManager.effectiveConfig →
   // appUtils 的路由外壳传进来），不再直接 import 全局 config.js。
   const config = ctx.config || {}
   const rateType = config.rateType ?? 3
   const enableClientDispatch = config.enableClientDispatch === true
   const qualityOpts = { enableHDR: config.enableHDR, enableH265: config.enableH265 }
+  // 可注入的取流请求函数，只给回归测试用（scripts/test-migu-account.mjs）；正常播放不带
+  if (ctx.fetchUrl) qualityOpts.fetchUrl = ctx.fetchUrl
 
   const cached = readCache(pid)
   if (cached) return cached
@@ -83,6 +95,9 @@ export async function resolve(ref, ctx = {}) {
       resObj = await getAndroidURL720p(pid, qualityOpts)
     } else {
       resObj = await getAndroidURL(userId, token, pid, rateType, qualityOpts)
+      // 账号失效时咪咕照样给流、只是按游客给：记下来让后台提醒（见 account.js）。
+      // 标清不带账号去要，回的必然是未登录，不算数
+      if (sendsAccount(userId, token, rateType)) noteAuth(userId, token, config, resObj?.content)
     }
   } catch (error) {
     console.log(error)

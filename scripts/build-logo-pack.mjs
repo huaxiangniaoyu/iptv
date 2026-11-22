@@ -13,10 +13,21 @@
  *       手工收一张：官方没有、模块取不到的频道（精选频道这类 m3u、官方确实没图的台）。
  *       --trim 裁掉四周与角落同色（透明或纯色底）的空白，图里留白太多时用。
  *       --bg <#颜色> 铺一层底色：官方只有纯白字台标时用，否则浅色界面上整个看不见。
+ *       --pad 铺底色时四周留一圈边：原图贴着边画的，不留边字会顶到色块边上。
+ *       --round 铺的底色做成圆角（和 CCTV 卡片一样的圆角比例），四角透明。
  *   node scripts/build-logo-pack.mjs --import <目录>
  *       批量手工收：目录里 <台标名>.<扩展名> 加一份 sources.json
  *       （{ "<台标名>": { "url": "...", "page": "...", "kind": "official|platform|library", "note": "...",
- *          "file": "可选，文件名与台标名不同时写", "trim": 可选 true, "bg": "可选，#颜色" } }）。
+ *          "file": "可选，文件名与台标名不同时写", "trim": 可选 true, "bg": "可选，#颜色", "pad": 可选 true, "round": 可选 true } }）。
+ *   node scripts/build-logo-pack.mjs --backdrop <#颜色> <台标名> [<台标名>…]
+ *       给已经收进来的图铺底色、四周留边：透明底纯黑字（深色界面上看不见）或纯白字（浅色界面上看不见）
+ *       的图用。模块 / 咪咕的图按记下的地址重新取原图，手工图用包里现有这张。底色记在 index.json（bg），
+ *       以后刷新照样铺；模块自己的图铺过底色后，服务端给这个模块的频道优先用内置这张，不用官网原图。
+ *   node scripts/build-logo-pack.mjs --card <台标名> [<台标名>…]
+ *       把透明底的单色台标做成统一的 16:9 圆角卡片，一次出三套样式：深色卡片白字（默认，文件名不变）、
+ *       浅色卡片（<名>@light.png）、央视蓝卡片白字（<名>@blue.png）。只改黑白灰，红色等彩色部分不动。
+ *       模块 / 咪咕的图按记下的地址重新取原图。用户在后台「设置 → 更新与显示」选用哪套（cctvLogoStyle）。
+ *       index.json 里记 card: true 和 styles；以后刷新照样出三套。目前用于央视频的 CCTV 台标。
  *   node scripts/build-logo-pack.mjs --remove <台标名>
  *
  * 所有图统一缩到长边不超过 256px 的 PNG（不放大位图），用本机 Chrome 的画布转码，不引入图片库依赖。
@@ -33,10 +44,12 @@ const PACK_DIR = process.env.mlogoPackDir || path.join(ROOT, 'logo-pack')
 const INDEX_PATH = path.join(PACK_DIR, 'index.json')
 const MAX_SIDE = 256
 const MAX_SOURCE_BYTES = 8 * 1024 * 1024
+// 铺底色时四周留的边，占长边的比例。透明底的官方图常贴着边画（央视频的 CCTV 台标左右只留 2px）
+const BACKDROP_PAD = 0.06
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 
 // 这些不是电视台：直播平台的主播间、景观 / 熊猫 / 慢直播机位的封面、活动直播间，不进内置台标
-const SKIP_MODULES = new Set(['livechina', 'ipanda', 'songjiang'])
+const SKIP_MODULES = new Set(['livechina', 'ipanda', 'songjiang', 'youtube-live'])
 const SKIP_GROUP = /景观|风景/
 const SKIP_REF = /^sichuan-live-/
 
@@ -132,7 +145,7 @@ export function sizeSvg(text) {
 
 let browser = null
 let page = null
-async function toPng(buf, { trim = false, bg = '' } = {}) {
+async function toPng(buf, { trim = false, bg = '', pad = 0, round = false } = {}) {
   let mime = detectMime(buf)
   if (!mime) throw new Error('不是图片')
   if (mime === 'image/svg+xml') buf = Buffer.from(sizeSvg(buf.toString('utf8')))
@@ -141,7 +154,7 @@ async function toPng(buf, { trim = false, bg = '' } = {}) {
     browser = await launchWithFallback({})
     page = await browser.newPage()
   }
-  const out = await page.evaluate(async (src, max, vector, trim, bg) => {
+  const out = await page.evaluate(async (src, max, vector, trim, bg, pad, round) => {
     const img = new Image()
     img.src = src
     await img.decode()
@@ -175,10 +188,13 @@ async function toPng(buf, { trim = false, bg = '' } = {}) {
       }
     }
     const [cropW, cropH] = [x1 - x0, y1 - y0]
-    // 位图不放大；矢量图按长边铺满
-    const scale = vector && !trim ? max / Math.max(cropW, cropH) : Math.min(1, max / Math.max(cropW, cropH))
-    const cw = Math.max(1, Math.round(cropW * scale))
-    const ch = Math.max(1, Math.round(cropH * scale))
+    // 位图不放大；矢量图按长边铺满。要留边的，连边一起不超过上限
+    const room = max / (1 + 2 * pad)
+    const scale = vector && !trim ? room / Math.max(cropW, cropH) : Math.min(1, room / Math.max(cropW, cropH))
+    const dw = Math.max(1, Math.round(cropW * scale))
+    const dh = Math.max(1, Math.round(cropH * scale))
+    const edge = pad ? Math.min(Math.round(Math.max(dw, dh) * pad), Math.floor((max - Math.max(dw, dh)) / 2)) : 0
+    const [cw, ch] = [dw + 2 * edge, dh + 2 * edge]
     const canvas = document.createElement('canvas')
     canvas.width = cw
     canvas.height = ch
@@ -186,19 +202,142 @@ async function toPng(buf, { trim = false, bg = '' } = {}) {
     ctx.imageSmoothingQuality = 'high'
     if (bg) {
       ctx.fillStyle = bg
-      ctx.fillRect(0, 0, cw, ch)
+      ctx.beginPath()
+      // 圆角和 CCTV 卡片同一比例（短边的 13%）
+      ctx.roundRect(0, 0, cw, ch, round ? Math.round(Math.min(cw, ch) * 0.13) : 0)
+      ctx.fill()
     }
-    ctx.drawImage(full, x0, y0, cropW, cropH, 0, 0, cw, ch)
+    ctx.drawImage(full, x0, y0, cropW, cropH, edge, edge, dw, dh)
     return { data: canvas.toDataURL('image/png'), width: cw, height: ch }
-  }, `data:${mime};base64,${buf.toString('base64')}`, MAX_SIDE, mime === 'image/svg+xml', trim, /^#[0-9a-f]{3,8}$/i.test(bg) ? bg : '')
+  }, `data:${mime};base64,${buf.toString('base64')}`, MAX_SIDE, mime === 'image/svg+xml', trim, bg, bg ? pad : 0, Boolean(bg && round))
   return { png: Buffer.from(out.data.split(',')[1], 'base64'), width: out.width, height: out.height }
 }
 
+/**
+ * 卡片样式：bg 卡片底色；fg 给黑白灰换的颜色（黑字变 fg、白色部分变 bg），不给就不换色。
+ * 默认样式写在不带后缀的文件里（对外引用的文件名不变），其余样式加 @<样式名> 后缀。
+ */
+export const CARD_STYLES = Object.freeze({
+  dark: { bg: '#202126', fg: '#f5f5f7' },
+  light: { bg: '#f6f6f8' },
+  blue: { bg: '#003f88', fg: '#ffffff' },
+})
+export const DEFAULT_CARD_STYLE = 'dark'
+const CARD_W = 256
+const CARD_H = 144
+
+async function toCard(buf, style) {
+  const mime = detectMime(buf)
+  if (!mime || mime === 'image/svg+xml') throw new Error('卡片只做位图')
+  if (!page) {
+    const { launchWithFallback } = await import('../utils/browserLauncher.js')
+    browser = await launchWithFallback({})
+    page = await browser.newPage()
+  }
+  const out = await page.evaluate(async (src, W, H, bg, fg) => {
+    const img = new Image()
+    img.src = src
+    await img.decode()
+    const [w, h] = [img.naturalWidth, img.naturalHeight]
+    const full = document.createElement('canvas')
+    full.width = w
+    full.height = h
+    const fctx = full.getContext('2d')
+    fctx.drawImage(img, 0, 0)
+    // 按不透明内容裁边
+    const data = fctx.getImageData(0, 0, w, h).data
+    let [x0, y0, x1, y1] = [w, h, -1, -1]
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      if (data[(y * w + x) * 4 + 3] <= 24) continue
+      x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y)
+    }
+    if (x1 < x0) throw new Error('图是空的')
+    const [cw, ch] = [x1 - x0 + 1, y1 - y0 + 1]
+    // 宽留 12% 边、高占七成，居中
+    const k = Math.min(W * 0.76 / cw, H * 0.7 / ch)
+    const [dw, dh] = [Math.round(cw * k), Math.round(ch * k)]
+    const layer = document.createElement('canvas')
+    layer.width = dw
+    layer.height = dh
+    const lctx = layer.getContext('2d')
+    lctx.imageSmoothingQuality = 'high'
+    lctx.drawImage(full, x0, y0, cw, ch, 0, 0, dw, dh)
+    const hex = c => [1, 3, 5].map(i => parseInt(c.slice(i, i + 2), 16))
+    if (fg) {
+      // 黑白灰按明度反过来：黑字 → fg，白色部分 → 卡片底色；有颜色的（红色 C）不动
+      const [b, f] = [hex(bg), hex(fg)]
+      const px = lctx.getImageData(0, 0, dw, dh)
+      const d = px.data
+      for (let i = 0; i < d.length; i += 4) {
+        if (!d[i + 3]) continue
+        const mx = Math.max(d[i], d[i + 1], d[i + 2]), mn = Math.min(d[i], d[i + 1], d[i + 2])
+        if (mx - mn >= 60) continue
+        const t = 1 - (mx + mn) / 510
+        for (let c = 0; c < 3; c++) d[i + c] = Math.round(b[c] + (f[c] - b[c]) * t)
+      }
+      lctx.putImageData(px, 0, 0)
+    }
+    const canvas = document.createElement('canvas')
+    canvas.width = W
+    canvas.height = H
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = bg
+    ctx.beginPath()
+    ctx.roundRect(0, 0, W, H, Math.round(H * 0.13))
+    ctx.fill()
+    ctx.drawImage(layer, Math.round((W - dw) / 2), Math.round((H - dh) / 2))
+    return { data: canvas.toDataURL('image/png'), width: W, height: H }
+  }, `data:${mime};base64,${buf.toString('base64')}`, CARD_W, CARD_H, style.bg, style.fg || '')
+  return { png: Buffer.from(out.data.split(',')[1], 'base64'), width: out.width, height: out.height }
+}
+
+const pngHash = png => createHash('sha1').update(png).digest('hex').slice(0, 10)
+const styleFile = (file, style) => file.replace(/\.png$/, `@${style}.png`)
+
+/** 把一张图做成三套卡片写进包里；返回 'added' | 'updated' | 'same' */
+async function putCard(index, name, buf, meta) {
+  const existing = index.logos[name]
+  const taken = new Set(Object.values(index.logos).filter(e => e !== existing).map(e => e.file.toLowerCase().replace(/\.png$/, '')))
+  const file = existing?.file || fileNameFor(name, taken)
+  const rendered = {}
+  for (const [style, spec] of Object.entries(CARD_STYLES)) rendered[style] = await toCard(buf, spec)
+  const main = rendered[DEFAULT_CARD_STYLE]
+  const hash = pngHash(main.png)
+  const styles = {}
+  for (const [style, { png, width, height }] of Object.entries(rendered)) {
+    if (style === DEFAULT_CARD_STYLE) continue
+    styles[style] = { file: styleFile(file, style), hash: pngHash(png), width, height }
+  }
+  const { bg, styles: oldStyles, ...rest } = meta
+  const same = existing?.card && existing.hash === hash
+    && Object.entries(styles).every(([style, entry]) => existing.styles?.[style]?.hash === entry.hash)
+  if (same) {
+    index.logos[name] = { ...existing, ...rest, card: true }
+    return 'same'
+  }
+  writeFileSync(path.join(PACK_DIR, file), main.png)
+  for (const [style, entry] of Object.entries(styles)) writeFileSync(path.join(PACK_DIR, entry.file), rendered[style].png)
+  index.logos[name] = { ...rest, card: true, file, hash, width: main.width, height: main.height, styles, updated: today() }
+  return existing ? 'updated' : 'added'
+}
+
+/** 给已收进来的一张图做卡片：模块 / 咪咕的图按记下的地址取原图。 */
+async function setCard(index, name) {
+  const entry = index.logos[name]
+  if (!entry) return `没有 ${name}`
+  if (entry.origin === 'manual') return `跳过 ${name}：手工图没有原图地址，请先用 --add 收原图`
+  if (!/^https?:\/\//i.test(entry.source || '')) return `跳过 ${name}：没记原图地址，取不到原图`
+  const { file, hash, width, height, updated, ...meta } = entry
+  const result = await putCard(index, name, await download(entry.source), meta)
+  return `${result === 'same' ? '未变' : '已做卡片'} ${name}`
+}
+
 const today = () => new Date().toISOString().slice(0, 10)
+const validColor = value => (/^#[0-9a-f]{3,8}$/i.test(value || '') ? value : '')
 
 /** 写入一张台标；图没变只更新出处，返回 'added' | 'updated' | 'same' */
-async function putLogo(index, name, buf, meta, { trim = false, bg = '' } = {}) {
-  const { png, width, height } = await toPng(buf, { trim, bg })
+async function putLogo(index, name, buf, meta, { trim = false, bg = '', pad = 0, round = false } = {}) {
+  const { png, width, height } = await toPng(buf, { trim, bg: validColor(bg), pad, round })
   const hash = createHash('sha1').update(png).digest('hex').slice(0, 10)
   const existing = index.logos[name]
   const taken = new Set(Object.values(index.logos).filter(e => e !== existing).map(e => e.file.toLowerCase().replace(/\.png$/, '')))
@@ -275,7 +414,16 @@ async function refresh(dataDir, { update = false } = {}) {
       const buf = item.file ? readFileSync(item.file) : await download(item.url)
       const before = index.logos[item.name]
       if (before?.origin === 'manual') stats.replacedManual.push(item.name)
-      const result = await putLogo(index, item.name, buf, { origin: item.origin, source: item.url || '' })
+      // 这张官方图做过卡片（--card）：重取时照样出三套
+      if (before?.card && before.origin === item.origin) {
+        const { file, hash, width, height, updated, ...meta } = before
+        stats[await putCard(index, item.name, buf, { ...meta, source: item.url || before.source })]++
+        seen.set(item.name, item.origin)
+        continue
+      }
+      // 这张官方图铺过底色（--backdrop）：重取时照样铺，不然一次 --update 就变回透明底
+      const bg = before?.origin === item.origin ? validColor(before.bg) : ''
+      const result = await putLogo(index, item.name, buf, { origin: item.origin, source: item.url || '', ...(bg ? { bg } : {}) }, { bg, pad: bg ? BACKDROP_PAD : 0 })
       stats[result]++
       seen.set(item.name, item.origin)
     } catch (e) {
@@ -288,13 +436,29 @@ async function refresh(dataDir, { update = false } = {}) {
   if (stats.failed.length) console.log(`取不到的：\n  ${stats.failed.join('\n  ')}`)
 }
 
-async function addManual(index, name, src, { source, kind, note, trim, bg }) {
+async function addManual(index, name, src, { source, kind, note, trim, bg, pad, round }) {
   if (index.logos[name] && index.logos[name].origin !== 'manual') {
     return `跳过 ${name}：已有官方来源（${index.logos[name].origin}）的图`
   }
   const buf = await readSource(src)
-  const result = await putLogo(index, name, buf, { origin: 'manual', source, kind: kind || 'official', ...(note ? { note } : {}) }, { trim, bg })
+  bg = validColor(bg)
+  const meta = { origin: 'manual', source, kind: kind || 'official', ...(note ? { note } : {}), ...(bg ? { bg } : {}), ...(bg && round ? { round: true } : {}) }
+  const result = await putLogo(index, name, buf, meta, { trim, bg, pad: pad ? BACKDROP_PAD : 0, round })
   return `${result === 'same' ? '未变' : result === 'added' ? '新增' : '更新'} ${name}`
+}
+
+/** 给已收进来的一张图铺底色、四周留边，底色记在这张图上。 */
+async function setBackdrop(index, name, bg) {
+  const entry = index.logos[name]
+  if (!entry) return `没有 ${name}`
+  const manual = entry.origin === 'manual'
+  // 手工图的出处多半是页面不是图片，只能拿包里现有这张铺；铺过的再铺一次会多留一圈边
+  if (manual && entry.bg) return `跳过 ${name}：已经铺过底色（${entry.bg}），要换颜色请用 --add 重新收原图`
+  if (!manual && !/^https?:\/\//i.test(entry.source || '')) return `跳过 ${name}：没记原图地址，取不到原图`
+  const buf = manual ? readFileSync(path.join(PACK_DIR, entry.file)) : await download(entry.source)
+  const { file, hash, width, height, updated, ...meta } = entry
+  const result = await putLogo(index, name, buf, { ...meta, bg }, { bg, pad: BACKDROP_PAD })
+  return `${result === 'same' ? '未变' : '已铺底色'} ${name}`
 }
 
 function parseArgs(argv) {
@@ -317,7 +481,30 @@ async function main() {
     if (args.add) {
       const index = loadIndex()
       if (!args._[0] || !args.source) throw new Error('用法：--add <台标名> <图片文件或地址> --source <出处> [--kind official|platform|library]')
-      console.log(await addManual(index, args.add, args._[0], { source: args.source, kind: args.kind, trim: args.trim === true, bg: args.bg }))
+      console.log(await addManual(index, args.add, args._[0], { source: args.source, kind: args.kind, trim: args.trim === true, bg: args.bg, pad: args.pad === true, round: args.round === true }))
+      saveIndex(index)
+    } else if (args.card) {
+      const index = loadIndex()
+      const names = [args.card, ...args._].filter(name => typeof name === 'string')
+      if (!names.length) throw new Error('用法：--card <台标名> [<台标名>…]')
+      for (const name of names) {
+        try {
+          console.log(await setCard(index, name))
+        } catch (e) {
+          console.log(`失败 ${name}：${e.message}`)
+        }
+      }
+      saveIndex(index)
+    } else if (args.backdrop) {
+      const index = loadIndex()
+      if (!validColor(args.backdrop) || !args._.length) throw new Error("用法：--backdrop '<#颜色>' <台标名> [<台标名>…]")
+      for (const name of args._) {
+        try {
+          console.log(await setBackdrop(index, name, args.backdrop))
+        } catch (e) {
+          console.log(`失败 ${name}：${e.message}`)
+        }
+      }
       saveIndex(index)
     } else if (args.import) {
       const index = loadIndex()
@@ -329,7 +516,7 @@ async function main() {
         if (!file) { console.log(`缺文件：${name}`); continue }
         try {
           console.log(await addManual(index, name, path.join(args.import, file), {
-            source: info.page || info.url, kind: info.kind, note: info.note, trim: info.trim === true, bg: info.bg,
+            source: info.page || info.url, kind: info.kind, note: info.note, trim: info.trim === true, bg: info.bg, pad: info.pad === true, round: info.round === true,
           }))
         } catch (e) {
           console.log(`失败 ${name}：${e.message}`)
@@ -341,6 +528,7 @@ async function main() {
       const entry = index.logos[args.remove]
       if (!entry) throw new Error(`没有 ${args.remove}`)
       unlinkSync(path.join(PACK_DIR, entry.file))
+      for (const style of Object.values(entry.styles || {})) unlinkSync(path.join(PACK_DIR, style.file))
       delete index.logos[args.remove]
       saveIndex(index)
       console.log(`已删除 ${args.remove}`)

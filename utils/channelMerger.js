@@ -3,6 +3,8 @@ import builtInSourceManager from "./builtInSources.js"
 import { getExtractorManager } from "./extractorManager.js"
 import { printBlue, printGreen, printYellow, printRed } from "./colorOut.js"
 import { isLocalGroup } from "./playlistConfig.js"
+import { sanitizeCatchup } from "./channelCatchup.js"
+import { hasReplaceToken } from "./replaceToken.js"
 
 // 频道的「主来源」标识（issue #29/#68 按档过滤源）：
 // 外部/内置/抓取模块的频道在 getValidChannels 里带上 sourceId（ext:<id> / bi:<id> / xt:<id>），
@@ -35,6 +37,15 @@ function dedupeAllChannels(allChannels) {
             if (!prev.sourceIds.includes(extra)) prev.sourceIds.push(extra)
           }
         }
+        // 留下的那条没给回看模式和模板、被去掉的这条给了：把声明接过来（自己写的天数优先），
+        // 否则同一路流会因为列在前面的源没写而退回订阅头的咪咕模板（issue #190）。
+        // 只在外部订阅之间转交：第三方订阅能把地址写成 migu:<pid> 等撞上咪咕 / 内置 / 模块频道的
+        // 去重键，不能借此改写这些频道的回看
+        if (isExternalChannel(prev) && isExternalChannel(ch)) {
+          const own = sanitizeCatchup(prev)
+          const other = sanitizeCatchup(ch)
+          if (!own.catchup && !own.catchupSource && other.catchup !== 'none') Object.assign(prev, other, own)
+        }
         continue
       }
       seen.set(key, ch)
@@ -43,6 +54,58 @@ function dedupeAllChannels(allChannels) {
     group.dataList = kept
   }
   return removed
+}
+
+// 频道上会写进播放列表的外来字段（台标还有咪咕的 pics.highResolutionH）。汇总到这里时，
+// 本项目自己的占位地址（咪咕 / 模块的 ${replace}/<ref>、本机台标）都还没生成——那是
+// updateData 写盘时才拼的，所以这些字段里出现占位符只可能来自外部数据。
+const FOREIGN_FIELDS = ['name', 'url', 'playURL', 'logo', 'pID', 'deferredRef']
+
+function hasForeignReplaceToken(channel) {
+  return FOREIGN_FIELDS.some(key => hasReplaceToken(channel?.[key])) || hasReplaceToken(channel?.pics?.highResolutionH)
+}
+
+// 丢掉带占位符 ${replace} 的外来频道（纯函数，供测试；原地改 dataList，与 dedupeAllChannels 同）。
+// 输出订阅时占位符会被换成「本机地址 + 访问密码 / 令牌」，第三方订阅、内置源 JSON、平台接口
+// 里写一个，凭据就拼进指向第三方的地址里了。整条丢弃而不是剔掉占位符：剔掉后剩下的是
+// 一条来路可疑、多半也播不了的地址。分组名带它的整组丢弃；因此被清空的分组一并去掉。
+// sources 是被丢频道的源归属（去重），日志里点名，用户才知道该去改哪个源。
+function dropForeignReplaceTokens(groups) {
+  let removed = 0
+  const sources = new Set()
+  const drop = channel => {
+    removed++
+    const sid = primarySourceId(channel)
+    if (sid) sources.add(sid)
+  }
+  const kept = []
+  for (const group of groups) {
+    const list = group.dataList || []
+    if (hasReplaceToken(group.name)) {
+      list.forEach(drop)
+      continue
+    }
+    const clean = []
+    for (const channel of list) {
+      if (hasForeignReplaceToken(channel)) drop(channel)
+      else clean.push(channel)
+    }
+    if (list.length && !clean.length) continue
+    group.dataList = clean
+    kept.push(group)
+  }
+  return { groups: kept, removed, sources: [...sources] }
+}
+
+// 外部源按名字报（ext:<id> 对用户没意义），其余报源归属本身（migu / bi:<id> / xt:<id>）
+function reportForeignReplaceTokens({ removed, sources }) {
+  if (!removed) return
+  const names = sources.map(sid => {
+    const ext = sid.startsWith('ext:') && (externalSourceManager.sources?.sources || []).find(s => s && `ext:${s.id}` === sid)
+    return ext?.name || sid
+  })
+  const from = names.length ? `（来源：${names.join('、')}）` : ''
+  printYellow(`丢弃 ${removed} 个带内部占位符 \${replace} 的频道${from}：输出订阅时它会换成本机地址和访问密码 / 令牌，外部数据里不允许出现`)
 }
 
 /** 「纪实」改名为「文旅」，并合并已经使用新名的其它来源。 */
@@ -179,14 +242,50 @@ function consolidateLocalChannels(groups, { targetGroup, matches, keyOf }) {
     appended.push(preferred.get(key) || channel, ...(userLines.get(key) || []))
     placedPreferred.add(key)
   }
-  // 合并优先级是「抓取模块 → 内置源 → 外部订阅」：地方官方频道插在第一个外部订阅频道之前，
-  // 不追加到组尾——否则精选列表里起播慢的海外台（World Poker Tour、UFC 24/7 等）会夹在
-  // 咪咕与各地体育频道中间。组里没有外部订阅频道时仍排在最后。紧贴官方线路的用户线路不算。
-  const firstExternal = merged.findIndex(channel => isExternalChannel(channel) && !gluedUserLines.has(channel))
-  merged.splice(firstExternal >= 0 ? firstExternal : merged.length, 0, ...appended)
-  contentGroup.dataList = merged
+  // 模块标了 trailing 的海外台（extractors/overseas）虽是模块频道，也排在组尾（见 moveTrailingChannelsLast）
+  const ordered = [...merged.filter(channel => channel?.trailing !== true), ...merged.filter(channel => channel?.trailing === true)]
+  // 合并优先级是「抓取模块 → 内置源 → 外部订阅」：地方官方频道插在第一个外部订阅频道
+  // （或海外台）之前，不追加到组尾——否则外部订阅里起播慢的海外台
+  // 会夹在咪咕与各地体育频道中间。组里没有这两类时仍排在最后。紧贴官方线路的用户线路不算。
+  const firstExternal = ordered.findIndex(channel =>
+    (isExternalChannel(channel) || channel?.trailing === true) && !gluedUserLines.has(channel))
+  ordered.splice(firstExternal >= 0 ? firstExternal : ordered.length, 0, ...appended)
+  contentGroup.dataList = ordered
 
   return output.filter(group => group.dataList.length > 0)
+}
+
+/**
+ * 模块接手了精选频道（IPTV.m3u）里的某台时，给频道标 supersedesFeatured：同组里同名（不分大小写）的
+ * 精选频道条目在新镜像里收掉，只留模块那份。精选列表是运行中的实例直接从仓库拉的，条目要留给没升级的
+ * 部署；而两份地址不同，按「名字 + 地址」的组内去重收不掉（先例：CNA、France 24 英语与法语台挪进
+ * 亚洲与国际直播模块，好把最高档挪到最前）。用户自己的订阅不受影响。
+ */
+function dropSupersededFeatured(groups) {
+  return groups.map(group => {
+    const names = new Set((group.dataList || [])
+      .filter(channel => channel?.supersedesFeatured === true)
+      .map(channel => String(channel.name || '').trim().toLowerCase()))
+    // Red Bull 旧单频道已删除；远程精选列表或旧缓存仍可能带着它。无论新模块是否开启都不恢复，
+    // 用户自己添加的订阅不受影响，新模块的综合频道归入「红牛轮播」。
+    const dataList = (group.dataList || []).filter(channel => !(channel?.builtInSubscription === true
+      && (String(channel.name || '').trim().toLowerCase() === 'red bull tv'
+        || names.has(String(channel.name || '').trim().toLowerCase()))))
+    return dataList.length === (group.dataList || []).length ? group : { ...group, dataList }
+  })
+}
+
+/**
+ * 海外频道模块（extractors/overseas）的台标了 trailing：在任何分组里都排到最后，跟在各台官方
+ * 频道与精选列表之后。它们是用户自己打开的海外免费频道，不该抢在各组原有频道前面
+ * （咪咕关着时它会是体育组里的第一个模块）。
+ */
+function moveTrailingChannelsLast(groups) {
+  return groups.map(group => {
+    const trailing = (group.dataList || []).filter(channel => channel?.trailing === true)
+    if (!trailing.length) return group
+    return { ...group, dataList: [...group.dataList.filter(channel => channel?.trailing !== true), ...trailing] }
+  })
 }
 
 function consolidateLocalKidsChannels(groups) {
@@ -314,9 +413,17 @@ async function getAllChannels() {
       }
     })
 
+    // 先清掉带占位符的外来频道，再做归并和去重：放到去重之后的话，恶意条目可能被留下、
+    // 同名同地址的干净条目被当成重复删掉，恶意条目随后再被丢弃，干净的那条就没了
+    const foreign = dropForeignReplaceTokens(allChannels)
+    allChannels = foreign.groups
+    reportForeignReplaceTokens(foreign)
+
     // 平台历史名「纪实」统一显示为「文旅」，外部精选频道
     // 也合并到同一组，避免新旧名并存。
     allChannels = normalizeContentGroupNames(allChannels)
+    allChannels = dropSupersededFeatured(allChannels)
+    allChannels = moveTrailingChannelsLast(allChannels)
 
     // 内容型分组按频道性质统一：地方体育 / 少儿 / 教育频道分别复制到
     // 对应内容组，地方组仍保持完整；同台多源时优先地方官方线路。
@@ -354,7 +461,9 @@ async function getAllChannels() {
     // 注意不能直接返回 fetchList 的裸数据——那份没有 deferredRef，写盘会变成
     // ${replace}/undefined，比少几个频道糟糕得多。
     try {
-      return getExtractorManager().getValidChannels()
+      const foreign = dropForeignReplaceTokens(getExtractorManager().getValidChannels())
+      reportForeignReplaceTokens(foreign)
+      return foreign.groups
     } catch (fallbackError) {
       printRed(`抓取模块缓存也不可用: ${fallbackError.message}`)
       return []
@@ -429,6 +538,30 @@ async function updateExtractors(options = {}) {
 }
 
 /**
+ * 一轮源刷新（上面三个 update* 的返回值）里，有没有源刷出了和上一轮不同的内容。
+ * 定时 tick 只在这时重新生成播放列表（issue #222）。没标 changed 的结果按「变了」算，
+ * 宁可多生成一次，也不能漏掉新地址。
+ */
+function hasChangedResult(result) {
+  if (result?.configChanged === true) return true
+  return Array.isArray(result?.results) && result.results.some(resultChanged)
+}
+
+/** 单个源的刷新结果算不算「内容变了」：失败但明确标了 changed（缓存被清、死链要从列表拿掉）也算 */
+function resultChanged(r) {
+  return r?.changed === true || (r?.success && r.changed !== false)
+}
+
+/** 本轮内容有变化的源名，让 tick 的日志说清是谁触发了重新生成（远程配置变了算一项） */
+function changedSourceNames(result) {
+  const names = Array.isArray(result?.results)
+    ? result.results.filter(resultChanged).map(r => r.name).filter(Boolean)
+    : []
+  if (result?.configChanged === true) names.unshift('内置源远程配置')
+  return names
+}
+
+/**
  * 获取外部源统计信息
  */
 function getExternalSourceStats() {
@@ -440,12 +573,17 @@ export {
   updateExternalSources,
   updateBuiltInSources,
   updateExtractors,
+  hasChangedResult,
+  changedSourceNames,
   getExternalSourceStats,
   externalSourceManager,
   builtInSourceManager,
   dedupeAllChannels,
+  dropForeignReplaceTokens,
   primarySourceId,
   normalizeContentGroupNames,
+  moveTrailingChannelsLast,
+  dropSupersededFeatured,
   consolidateLocalSportsChannels,
   consolidateLocalKidsChannels,
   consolidateLocalEducationChannels

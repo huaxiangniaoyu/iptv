@@ -22,11 +22,15 @@ built-in-sources-cache.json
 # 抓取模块的配置与缓存（不设 mdataDir 时默认写在当前目录）
 extractors.json
 extractor-cache.json
+alerts-state.json
+notify-channels.json
+notify-state.json
 extractors.json.corrupt
 built-in-sources-remote.json
 pe-cache.json
 # 央视频持久浏览器登录态（等同账号凭据，不进入仓库/JSON 配置备份）
 /yangshipin/
+/iqiyi-sports/
 
 # 外部 EPG 源下载缓存（issue #38）
 epg-cache/
@@ -42,3 +46,15 @@ data/
 
 # probe-m3u.mjs 探活脚本生成的报告
 probe-report.md
+
+# Private iQiyi VOD account/progress/job state when DATA_DIR is the repository root
+/iqiyi-vod/
+
+# 红果短剧账号会话、设备会话和媒体缓存（mdataDir 未设置时）
+/hongguo-vod/
+
+# 本地 YouTube 解析环境
+/.runtime/youtube/
+
+# Python helper bytecode
+**/__pycache__/

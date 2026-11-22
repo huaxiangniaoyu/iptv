@@ -6,7 +6,8 @@ export default {
   id: 'hnntv',
   name: '海南',
   description: '海南卫视、三沙卫视及五个地面频道官方直播。播放时自动换取短效签名地址。',
-  capabilities: { cache: 'disk', resolve: true, epg: true },
+  // catchup: false —— 只做直播：官方直播地址不认回看时间参数（带上也照回直播），频道逐条标 catchup:'none'，不继承订阅头的回看声明
+  capabilities: { cache: 'disk', resolve: true, epg: true, catchup: false },
   outputGroupName: '海南',
   defaultRefreshMinutes: 240,
   refreshConfigurable: false,
@@ -17,7 +18,8 @@ export default {
   epg,
 
   async fetch(_config, ctx = {}) {
-    const rows = await fetchChannelList({ timeoutMs: ctx.timeoutMs, fetchImpl: ctx.fetchImpl })
+    // 不传 ctx.timeoutMs（通用 10 秒）：这个接口常要 12～13 秒，等 CHANNEL_LIST_TIMEOUT_MS（见 api.js）
+    const rows = await fetchChannelList({ fetchImpl: ctx.fetchImpl })
     primeChannelCache(rows, ctx.now ?? Date.now())
     const channels = buildChannels(rows)
     if (!channels.length) throw new Error('海南网台接口成功，但没有找到七套正式电视频道（官网可能已改版）')

@@ -29,6 +29,8 @@ function parseBool(value, fallback) {
 // 清洗 URL 路径段（用于自定义管理页路径）：去首尾斜杠，禁止内部斜杠/空白，
 // 避开与内置路由冲突的保留字，非法时回退默认值
 const RESERVED_SEGMENTS = ['api', 'player', 'favicon.ico']
+// 央视频 CCTV 台标的三套卡片样式（scripts/build-logo-pack.mjs 的 CARD_STYLES），第一个是默认
+const CCTV_LOGO_STYLES = ['dark', 'light', 'blue']
 function sanitizeSegment(value, fallback) {
   if (!value) return fallback
   const s = String(value).trim().replace(/^\/+|\/+$/g, '')
@@ -40,7 +42,7 @@ function sanitizeSegment(value, fallback) {
 // ESM 命名导出是实时绑定，重新赋值后所有 import 方都会读到新值。
 // 注意：port、programInfoUpdateInterval 在 server.listen / setInterval 时已被读取，
 // 热更新不会改变已启动的监听端口与定时器周期，这两项仍需重启生效。
-let userId, token, port, host, rateType, debug, pass, enableHDR, enableH265, programInfoUpdateInterval, refreshToken, adminPath, externalLogoBase, externalLogoIndex, enableTvgNormalize, enableEpgAggregation, enableLogoCache, enableUserTokens, enableDisplayNameUnify, enableClientDispatch
+let userId, token, port, host, rateType, debug, pass, enableHDR, enableH265, programInfoUpdateInterval, refreshToken, adminPath, externalLogoBase, externalLogoIndex, enableTvgNormalize, enableEpgAggregation, enableLogoCache, enableUserTokens, enableDisplayNameUnify, enableClientDispatch, proxy, cctvLogoStyle
 // 内容开关：咪咕核心 / 内置单频道源 / 内置订阅源。默认全开（老用户零感知）
 let enableMigu, enableBuiltInSources, enableBuiltInSubscriptions, enableExtractors
 
@@ -98,6 +100,10 @@ function applyConfig(systemConfig) {
   enableEpgAggregation = systemConfig.enableEpgAggregation !== undefined ? systemConfig.enableEpgAggregation : parseBool(process.env.menableEpgAggregation, true)
   // 台标本机托管：更新时把台标下载到数据目录、由本机提供，播放器不再直连台标库与各台图床，默认开。
   enableLogoCache = systemConfig.enableLogoCache !== undefined ? systemConfig.enableLogoCache : parseBool(process.env.menableLogoCache, true)
+  // 央视频 CCTV 台标样式（后台「设置 → 更新与显示」）：内置台标里做成卡片的那几十张用哪套。
+  // dark 深色卡片白字（默认）、light 浅色卡片、blue 央视蓝卡片白字；写错了按默认。
+  const style = systemConfig.cctvLogoStyle ?? process.env.mcctvLogoStyle
+  cctvLogoStyle = CCTV_LOGO_STYLES.includes(style) ? style : 'dark'
   // 用户访问令牌（一人一源）：开启后台「用户管理」生成的 /u/<token>/ 链接才生效。默认开，但无任何用户时完全不激活（对老部署零影响）。
   enableUserTokens = systemConfig.enableUserTokens !== undefined ? systemConfig.enableUserTokens : parseBool(process.env.menableUserTokens, true)
   // 统一频道显示名（issue #56）：按归一规则把异构源的频道显示名也统一到规范名（如 CCTV1/CCTV-1 → CCTV1综合）。
@@ -107,6 +113,9 @@ function applyConfig(systemConfig) {
   // 由观看设备的网络就近分配节点。解决服务器与观看设备运营商不同（如服务器移动宽带、电视联通网）时的跨网卡顿。
   // 默认关（opt-in）：多数部署服务器与设备同网，服务端解析可少一跳 302，且个别老盒子对多级跳转兼容性存疑。
   enableClientDispatch = systemConfig.enableClientDispatch !== undefined ? systemConfig.enableClientDispatch : parseBool(process.env.menableClientDispatch, false)
+  // 网络代理（后台「设置 → 网络代理」）：供声明了 outbound: 'proxy' 的模块（YouTube、澳门、海外频道、Red Bull TV、Xumo Play，见 extractors/registry.js）和 Telegram 使用，见 utils/outboundProxy.js。
+  // 没有对应的 m 开头环境变量：留空时上述模块沿用标准的 HTTPS_PROXY。
+  proxy = typeof systemConfig.proxy === 'string' ? systemConfig.proxy.trim() : ""
 
   // 空白模式总开关：开启后下面三项内容开关「默认」翻转为关（一行得到空白 docker）。
   // 优先级：细粒度开关显式值 > 总开关推出的默认 > 全开。所以可 mblank=true + menableMigu=true 单独留咪咕。
@@ -114,7 +123,7 @@ function applyConfig(systemConfig) {
   const defOn = !blank
   // 咪咕核心（CCTV/卫视抓取 + 体育赛事 + EPG + token刷新）
   enableMigu = systemConfig.enableMigu !== undefined ? systemConfig.enableMigu : parseBool(process.env.menableMigu, defOn)
-  // 内置单频道源（built-in-sources.json：纬来体育/RedBull/4K卫视等）
+  // 内置单频道源（built-in-sources.json：纬来体育/4K卫视等）
   enableBuiltInSources = systemConfig.enableBuiltInSources !== undefined ? systemConfig.enableBuiltInSources : parseBool(process.env.menableBuiltInSources, defOn)
   // 内置订阅源（精选频道）
   enableBuiltInSubscriptions = systemConfig.enableBuiltInSubscriptions !== undefined ? systemConfig.enableBuiltInSubscriptions : parseBool(process.env.menableBuiltInSubscriptions, defOn)
@@ -135,7 +144,7 @@ applyConfig(loadSystemConfig())
 // 重新加载系统配置（保存系统配置后调用，避免必须重启进程）
 function reloadConfig() {
   applyConfig(loadSystemConfig())
-  return { userId, token, port, host, rateType, pass, enableHDR, enableH265, programInfoUpdateInterval, refreshToken, adminPath, externalLogoBase, externalLogoIndex, enableTvgNormalize, enableEpgAggregation, enableLogoCache, enableUserTokens, enableDisplayNameUnify, enableClientDispatch, enableMigu, enableBuiltInSources, enableBuiltInSubscriptions, enableExtractors }
+  return { userId, token, port, host, rateType, pass, enableHDR, enableH265, programInfoUpdateInterval, refreshToken, adminPath, externalLogoBase, externalLogoIndex, enableTvgNormalize, enableEpgAggregation, enableLogoCache, enableUserTokens, enableDisplayNameUnify, enableClientDispatch, proxy, cctvLogoStyle, enableMigu, enableBuiltInSources, enableBuiltInSubscriptions, enableExtractors }
 }
 
-export { userId, token, port, host, rateType, debug, pass, enableHDR, programInfoUpdateInterval, enableH265, refreshToken, adminPath, externalLogoBase, externalLogoIndex, enableTvgNormalize, enableEpgAggregation, enableLogoCache, enableUserTokens, enableDisplayNameUnify, enableClientDispatch, enableMigu, enableBuiltInSources, enableBuiltInSubscriptions, enableExtractors, reloadConfig, sanitizeSegment }
+export { userId, token, port, host, rateType, debug, pass, enableHDR, programInfoUpdateInterval, enableH265, refreshToken, adminPath, externalLogoBase, externalLogoIndex, enableTvgNormalize, enableEpgAggregation, enableLogoCache, enableUserTokens, enableDisplayNameUnify, enableClientDispatch, proxy, cctvLogoStyle, CCTV_LOGO_STYLES, enableMigu, enableBuiltInSources, enableBuiltInSubscriptions, enableExtractors, reloadConfig, sanitizeSegment }

@@ -15,7 +15,11 @@
  * 注意：opts 可能来自用户添加的第三方订阅（不可信输入）。渲染进播放列表等于
  * 把内容写进一个换行敏感的格式里，因此这里做两层限制——键名白名单 + 含换行/
  * 控制字符者整条拒收，防止一条 opt 撑开成任意 M3U 指令（与 EXTINF 属性消毒同理）。
+ * 含本机地址占位符 ${replace} 的也整条拒收：输出时它会被换成带访问密码 / 令牌的本机地址，
+ * 再作为 Referer / UA 发给第三方 CDN（见 replaceToken.js）。
  */
+
+import { hasReplaceToken } from './replaceToken.js'
 
 const OPT_PREFIX = '#EXTVLCOPT:'
 
@@ -69,6 +73,7 @@ export function sanitizeOpt(raw) {
   if (raw.length > MAX_OPT_LENGTH) return null
   // 换行会撑出额外的 M3U 指令；其余 C0 控制字符进请求头同样无意义
   if (/[\r\n\u0000-\u001f\u007f]/.test(raw)) return null
+  if (hasReplaceToken(raw)) return null
 
   const trimmed = raw.trim()
   const eq = trimmed.indexOf('=')
@@ -156,6 +161,39 @@ export function omitPlayerOnlyOpts(content) {
 export function needsOpts(channel) {
   return sanitizeOpts(channel && channel.opts)
     .some(opt => HEADER_KEYS.has(opt.slice(0, opt.indexOf('='))))
+}
+
+/**
+ * 清洗用户填的 User-Agent（订阅源设置里的自定义 UA，issue #170）。
+ * 与 opt 同一套规则：含换行/控制字符、超长者整条作废——node-fetch 遇到这种请求头
+ * 会直接抛错，写进播放列表又会撑开 M3U 指令。不合法或留空返回 ''。
+ */
+export function cleanUserAgent(ua) {
+  const opt = sanitizeOpt(`http-user-agent=${typeof ua === 'string' ? ua : ''}`)
+  return opt ? opt.slice('http-user-agent='.length) : ''
+}
+
+/**
+ * 取 opts 里的 User-Agent，没有返回 ''。
+ */
+export function userAgentOf(opts) {
+  const opt = sanitizeOpts(opts).find(o => o.startsWith('http-user-agent='))
+  return opt ? opt.slice('http-user-agent='.length) : ''
+}
+
+/**
+ * 给一个频道补上播放用的 User-Agent（订阅源「播放时也带上」，issue #170）。
+ *
+ * - 频道自己已带 http-user-agent 的保持原样：那是订阅方逐台写的，比整源统一填的更准；
+ * - 只给 http(s) 地址补：rtp/udp 组播不走 HTTP，补了没用，反倒让它被 TXT 订阅跳过
+ *  （见 needsOpts）。
+ * 返回新数组，不改入参；无需补时原样返回。
+ */
+export function withUserAgent(opts, ua, url) {
+  const clean = cleanUserAgent(ua)
+  const list = Array.isArray(opts) ? opts : []
+  if (!clean || !/^https?:\/\//i.test(String(url || '')) || userAgentOf(list)) return opts
+  return [...list, `http-user-agent=${clean}`]
 }
 
 export { HEADER_KEYS, PLAYER_KEYS }

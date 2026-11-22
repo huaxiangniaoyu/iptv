@@ -127,7 +127,7 @@ async function waitForApp() {
   for (let attempt = 0; attempt < 100; attempt++) {
     try {
       const response = await request('/favicon.ico')
-      if (response.status === 204) return
+      if (response.status === 200) return
     } catch (error) {
       lastError = error
     }
@@ -148,6 +148,37 @@ console.log('app.js 央视频本地媒体路由回归测试')
 try {
   await import('../app.js')
   await waitForApp()
+
+  await check('三台超高清沿用鉴权和订阅入口，切换配置后只改变新主清单', async () => {
+    const { getExtractorManager } = await import('../utils/extractorManager.js')
+    const manager = getExtractorManager()
+    for (const ref of ['ysp-cctv4k', 'ysp-cctv164k', 'ysp-cctv8k']) {
+      const head = await request('/' + PASS + '/relay/' + ref + '.m3u8', { method: 'HEAD' })
+      assert.equal(head.status, 200)
+      const cast = await request('/' + PASS + '/relay/' + ref + '.m3u8')
+      assert.match(cast.body.toString(), new RegExp('/' + PASS + '/ysp-cast/cast/' + ref + '\\.m3u8'))
+      const user = await request('/u/' + USER_TOKEN + '/proxy/' + ref + '.m3u8')
+      assert(user.body.toString().includes('/u/' + USER_TOKEN + '/ysp-cast/cast/' + ref + '.m3u8'))
+    }
+    manager.updateModuleConfig('yangshipin', { uhdSource: 'main' })
+    const main = await request('/' + PASS + '/relay/ysp-cctv8k.m3u8')
+    assert(main.body.toString().includes('/' + PASS + '/ysp-cast/main/ysp-cctv8k.m3u8'))
+    assert.throws(() => manager.updateModuleConfig('yangshipin', { uhdSource: 'invalid' }))
+    assert.equal(manager.effectiveConfig((await import('../extractors/yangshipin/index.js')).default).uhdSource, 'main')
+    // 「CCTV、CGTN 共 26 台」：普通台的同一个订阅地址改给投屏主清单（issue #240）；默认档的普通台见下面清单直出那条
+    manager.updateModuleConfig('yangshipin', { uhdSource: 'all' })
+    for (const ref of ['ysp-cctv1', 'ysp-cgtnfy', 'ysp-cctv8k']) {
+      const all = await request('/' + PASS + '/relay/' + ref + '.m3u8')
+      assert.equal(all.status, 200)
+      assert(all.body.toString().includes('/' + PASS + '/ysp-cast/cast/' + ref + '.m3u8'), ref)
+    }
+    const allUser = await request('/u/' + USER_TOKEN + '/proxy/ysp-cctv13.m3u8')
+    assert(allUser.body.toString().includes('/u/' + USER_TOKEN + '/ysp-cast/cast/ysp-cctv13.m3u8'))
+    manager.updateModuleConfig('yangshipin', { uhdSource: 'cast' })
+    assert.equal(existsSync(join(DATA_DIR, 'yangshipin/cast-device')), false, '主清单、HEAD和设置不启动取票服务')
+    assert.notEqual((await request('/ysp-cast/cast/ysp-cctv8k.m3u8')).status, 200, '固定来源路径也要鉴权')
+    assert.equal(chromiumStarts, 0)
+  })
 
   await check('mpass + relay/proxy master 保留密码前缀，并指向本机音视频子清单', async () => {
     const response = await request(`/${PASS}/relay/ysp-vip-cctvfyzq.m3u8?session=pass`)
@@ -212,6 +243,16 @@ try {
       const proxied = await request(`/${PASS}/proxy/ysp-cctv2.m3u8`, { headers: vlc })
       assert.equal(proxied.status, 200)
       assert.equal(proxied.body.toString().includes('ysp-pad'), false, '全代理不换视图')
+      const { getExtractorManager } = await import('../utils/extractorManager.js')
+      const manager = getExtractorManager()
+      const fetchBeforeSave = globalThis.fetch
+      let newRequests = 0
+      globalThis.fetch = (...args) => { newRequests++; return fetchBeforeSave(...args) }
+      manager.updateModuleConfig('yangshipin', { uhdSource: 'main' })
+      const continued = await request(`/${PASS}/relay/ysp-cctv2.m3u8`, { headers: vlc })
+      assert.equal(continued.status, 200)
+      assert.equal(newRequests, 0, '仅保存超高清来源不能清空普通频道在播票据/清单缓存')
+      manager.updateModuleConfig('yangshipin', { uhdSource: 'cast' })
     } finally {
       globalThis.fetch = realFetch
     }
@@ -312,21 +353,25 @@ try {
     assert.equal(existsSync(marker), false)
     assert.deepEqual(await runLoginKeepalive(), { skipped: 'unlinked' })
 
-    runtime.loginLink.remember({ authenticated: true, account: { nickname: '测试账号', vip: true } })
+    const t0 = Date.now()
+    runtime.loginLink.remember({ authenticated: true, account: { nickname: '测试账号', vip: true } }, t0)
     assert.equal(existsSync(marker), true)
     assert.equal(runtime.loginLink.read().nickname, '测试账号')
     assert.equal(runtime.loginLink.read().vip, true)
     const linkedAt = runtime.loginLink.read().linkedAt
-    runtime.loginLink.remember({ authenticated: true, account: { nickname: '测试账号', vip: false } })
+    runtime.loginLink.remember({ authenticated: true, account: { nickname: '测试账号', vip: true } }, t0 + 1_000)
     assert.equal(runtime.loginLink.read().linkedAt, linkedAt, '重复确认不改首次关联时间')
 
-    runtime.loginLink.remember({ authenticated: false, account: null })
+    // 单次读到未登录先不动标记，隔开 20 秒以上再读到才清
+    runtime.loginLink.remember({ authenticated: false, account: null }, t0 + 2_000)
+    assert.equal(existsSync(marker), true)
+    runtime.loginLink.remember({ authenticated: false, account: null }, t0 + 60_000)
     assert.equal(existsSync(marker), false)
     assert.deepEqual(await runLoginKeepalive(), { skipped: 'unlinked' })
   })
 
   await check('客户端批量探测：同一客户端连续 GET 多个公开频道，第 6 个起本地拒绝、不再打上游；别的客户端不受影响', async () => {
-    // 央视频取票走全局 fetch，这里桩成 403：前几路会真的进解析链（并失败），拒绝的一路不该碰它
+    // 新频道桩成 403；前面测过的 CCTV2 则仍有共享刷新窗口内的有效清单。
     const realFetch = globalThis.fetch
     let upstream = 0
     globalThis.fetch = async () => { upstream++; return new Response('denied', { status: 403 }) }
@@ -337,7 +382,9 @@ try {
         const response = await request(`/${PASS}/relay/ysp-${ref}.m3u8`, { headers: { 'User-Agent': 'scan-test/1.0' } })
         outcomes.push({ status: response.status, body: response.body.toString(), hit: upstream > before })
       }
-      assert.ok(outcomes.slice(0, 5).every(o => o.hit), '前 5 个台正常进解析链')
+      assert.ok(outcomes.slice(0, 5).filter((_, i) => i !== 1).every(o => o.hit), '前 5 个台中的新频道正常进解析链')
+      assert.match(outcomes[1].body, /^#EXTM3U/, '已经在播的 CCTV2 继续拿有效清单')
+      assert.equal(outcomes[1].hit, false, '有效共享清单不因扫描重复打上游')
       assert.ok(outcomes.slice(5).every(o => !o.hit), '第 6 个起一枪都不打上游')
       assert.ok(outcomes.slice(5).every(o => o.status === 200 && o.body.includes('批量探测')), '拒绝仍是 code 200 + 中文原因')
       const before = upstream

@@ -58,6 +58,42 @@ check('master 清单里的子清单保留 .m3u8 后缀（拍平失败时的回�
   assert.match(out[2], /^s[0-9a-f]{16}\.m3u8$/)
 })
 
+check('不带后缀的子清单按 HLS 语义补 .m3u8，不被当成分片透传（issue #235）', () => {
+  // cdn.qd.je 实际下发的 master：子清单地址没有后缀
+  const master = '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=5000000\nhttps://cdn6.cc.cd/163189/ch8'
+  const out = toProxyManifest(master, 'cp-issue235').split('\n')
+  assert.match(out[2], /^s[0-9a-f]{16}\.m3u8$/)
+  assert.equal(lookup(out[2].replace(/\..*$/, '')).url, 'https://cdn6.cc.cd/163189/ch8')
+
+  // 只影响紧跟 STREAM-INF 的那一行；媒体清单里无后缀的分片仍是 .ts
+  const media = '#EXTM3U\n#EXTINF:8.0,\nhttps://cdn6.cc.cd/api/ch8/5632507\n#EXTINF:8.0,\nhttps://cdn6.cc.cd/api/ch8/5632508'
+  const segs = toProxyManifest(media, 'cp-issue235').split('\n')
+  assert.match(segs[2], /^s[0-9a-f]{16}\.ts$/)
+  assert.match(segs[4], /^s[0-9a-f]{16}\.ts$/)
+
+  // master 里多条码率：每条都补 .m3u8，中间夹的其它标签不打断
+  const multi = '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2\n#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:00Z\nhttps://a.example/hi\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhttps://a.example/lo'
+  const lines = toProxyManifest(multi, 'cp-issue235').split('\n')
+  assert.match(lines[3], /^s[0-9a-f]{16}\.m3u8$/)
+  assert.match(lines[5], /^s[0-9a-f]{16}\.m3u8$/)
+})
+
+check('EXT-X-MEDIA / I 帧清单的 URI 不带后缀时补 .m3u8，EXT-X-KEY 仍是 .key', () => {
+  const src = [
+    '#EXTM3U',
+    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="zh",URI="https://a.example/audio"',
+    '#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=1,URI="https://a.example/iframe"',
+    '#EXT-X-KEY:METHOD=AES-128,URI="https://a.example/key"',
+    '#EXT-X-STREAM-INF:BANDWIDTH=1,AUDIO="a"',
+    'https://a.example/video',
+  ].join('\n')
+  const out = toProxyManifest(src, 'cp-issue235').split('\n')
+  assert.match(out[1], /URI="s[0-9a-f]{16}\.m3u8"/)
+  assert.match(out[2], /URI="s[0-9a-f]{16}\.m3u8"/)
+  assert.match(out[3], /URI="s[0-9a-f]{16}\.key"/)
+  assert.match(out[5], /^s[0-9a-f]{16}\.m3u8$/)
+})
+
 check('顶层清单与嵌套子清单的分片地址落到同一条路由（同目录，无需按层区分）', () => {
   const seg = 'http://cdn.example.com/live/a-1.ts'
   const top = toProxyManifest(seg, '608807420').trim()
@@ -70,6 +106,24 @@ check('分片 key 带 s 前缀：与数字/命名空间频道引用的清单路�
   const key = register('http://cdn.example.com/live/x.ts')
   assert.match(key, /^s[0-9a-f]{16}$/)
   assert.ok(!/^\d+$/.test(key))
+})
+
+check('有限点播清单持续播放会保留尚未请求的后段，停止十分钟后回收', () => {
+  const originalNow = Date.now
+  let now = originalNow()
+  try {
+    Date.now = () => now
+    const first = 'http://cdn.example.com/vod-lease-first.ts', last = 'http://cdn.example.com/vod-lease-last.ts'
+    const manifest = toProxyManifest(`#EXTM3U\n#EXTINF:5,\n${first}\n#EXTINF:5,\n${last}\n#EXT-X-ENDLIST\n`, 'vod-lease-test')
+    assert.match(manifest, /#EXT-X-ENDLIST/)
+    const keys = manifest.split('\n').filter(l => l.endsWith('.ts')).map(l => l.slice(0, -3))
+    now += 9 * 60 * 1000
+    assert.ok(lookup(keys[0]))
+    now += 9 * 60 * 1000
+    assert.equal(lookup(keys[1]).url, last, '18 分钟后仍能跳到未请求的末段')
+    now += 11 * 60 * 1000
+    assert.equal(lookup(keys[1]), null)
+  } finally { Date.now = originalNow }
 })
 
 check('同一上游地址登记结果稳定；非绝对地址原样保留', () => {
@@ -222,7 +276,7 @@ const cdn = http.createServer((req, res) => {
     return
   }
   if (path === '/ua-gated/segment.ts') {
-    // 安徽视讯 CDN 形态：按 User-Agent 放行，只认 App 播放器标识
+    // 模拟按 User-Agent 放行的 CDN，验证模块声明的标识不会被代理覆盖。
     if (req.headers['user-agent'] !== 'ijkplayer') { res.writeHead(403); res.end('ua rejected'); return }
     res.writeHead(200, { 'Content-Type': 'video/mp2t', 'Content-Length': SEG_BODY.length })
     res.end(SEG_BODY)
@@ -249,6 +303,12 @@ const cdn = http.createServer((req, res) => {
   if (path === '/live/seg-100.ts') {
     res.writeHead(200, { 'Content-Type': 'video/mp2t', 'Content-Length': SEG_BODY.length, 'Accept-Ranges': 'bytes' })
     res.end(SEG_BODY)
+    return
+  }
+  if (path === '/live/interrupted.ts') {
+    res.writeHead(200, { 'Content-Type': 'video/mp2t' })
+    res.write(SEG_BODY.subarray(0, 8))
+    setTimeout(() => res.destroy(), 30)
     return
   }
   res.writeHead(404); res.end()
@@ -499,6 +559,13 @@ await checkAsync('上游分片 4xx 原样透传状态码，pipeUpstream 报告�
   const key = register(`http://127.0.0.1:${cdn.address().port}/live/missing.ts`, 'fail-test')
   const resp = await fetch(`${nasBase}/proxy/${key}.ts`)
   assert.equal(resp.status, 404)
+})
+
+await checkAsync('上游在 chunked 200 中途断开，播放器必须收到下载失败而非完整残片', async () => {
+  const key = register(`http://127.0.0.1:${cdn.address().port}/live/interrupted.ts`, 'interrupted-test')
+  const resp = await fetch(`${nasBase}/proxy/${key}.ts`)
+  assert.equal(resp.status, 200)
+  await assert.rejects(resp.arrayBuffer())
 })
 
 // 放在所有会 lookup 既有 key 的用例之后：本用例灌入 5000+ 条登记，会把早前的测试 key 挤掉

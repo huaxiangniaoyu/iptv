@@ -24,10 +24,12 @@ import { join } from 'node:path'
 const TMP = mkdtempSync(join(tmpdir(), 'iptv-extsave-test-'))
 process.env.mdataDir = TMP
 
-const { ExternalSourceManager, BUILT_IN_SUBSCRIPTIONS } = await import('../utils/externalSources.js')
+const { ExternalSourceManager, BUILT_IN_SUBSCRIPTIONS, DEFAULT_CUSTOM_SUBSCRIPTIONS } = await import('../utils/externalSources.js')
 
 const P = join(TMP, 'external-sources.json')
 const BUILT_IN_URL = BUILT_IN_SUBSCRIPTIONS[0].subscriptionUrl
+// 默认自定义订阅「网络分享」：夹具里标成已播种，免得它在这些与它无关的场景里冒出来
+const DEFAULT_URL = DEFAULT_CUSTOM_SUBSCRIPTIONS[0].source.subscriptionUrl
 const RETIRED_URL = 'https://raw.githubusercontent.com/YueChan/Live/refs/heads/main/GNTV.m3u'
 
 let passed = 0
@@ -52,6 +54,7 @@ check('删掉内置订阅 →（后台保存一次）→ 重启，不复活', ()
     enabled: true, includeInPlaylists: true, updateOnStartup: true,
     sources: [{ name: '我自己的源', mode: 'direct', enabled: true, m3u8Url: 'http://x/y.m3u8', id: 'aaaa1111' }],
     seededBuiltInUrls: [BUILT_IN_URL],     // 已播种过 → 用户是"删掉"而不是"没装过"
+    seededDefaultSubscriptions: [DEFAULT_URL],
     retiredBuiltInsV1: true,
   })
 
@@ -74,6 +77,7 @@ check('保存不抹掉 retiredBuiltInsV1 → 用户手动加回的已退役订�
     // 用户明知它已退役，仍手动加了回来
     sources: [{ name: '我要的旧港澳源', mode: 'subscription', enabled: true, subscriptionUrl: RETIRED_URL, id: 'bbbb2222' }],
     seededBuiltInUrls: [BUILT_IN_URL],
+    seededDefaultSubscriptions: [DEFAULT_URL],
     retiredBuiltInsV1: true,
   })
 
@@ -97,6 +101,7 @@ check('★ 调用方省略了用户可见键时，不得用旧值补回去（否
     enabled: true, includeInPlaylists: true, updateOnStartup: true,
     sources: [{ name: 'A', mode: 'direct', enabled: true, m3u8Url: 'http://a/', id: 'aaaa0001' }],
     seededBuiltInUrls: [BUILT_IN_URL],
+    seededDefaultSubscriptions: [DEFAULT_URL],
     retiredBuiltInsV1: true,
   })
   const mgr = new ExternalSourceManager()
@@ -121,6 +126,7 @@ check('只补服务端账本键，sources 等字段仍以调用方为准', () =>
       { name: 'B', mode: 'direct', enabled: true, m3u8Url: 'http://b/', id: 'bbbb0002' },
     ],
     seededBuiltInUrls: [BUILT_IN_URL],
+    seededDefaultSubscriptions: [DEFAULT_URL],
     retiredBuiltInsV1: true,
   })
   const mgr = new ExternalSourceManager()
@@ -139,7 +145,7 @@ check('只补服务端账本键，sources 等字段仍以调用方为准', () =>
 check('调用方显式带了账本键时以调用方为准（导入配置等路径）', () => {
   write({
     enabled: true, includeInPlaylists: true, updateOnStartup: true,
-    sources: [], seededBuiltInUrls: [BUILT_IN_URL], retiredBuiltInsV1: true,
+    sources: [], seededBuiltInUrls: [BUILT_IN_URL], seededDefaultSubscriptions: [DEFAULT_URL], retiredBuiltInsV1: true,
   })
   const mgr = new ExternalSourceManager()
   mgr.saveSources({
@@ -147,6 +153,98 @@ check('调用方显式带了账本键时以调用方为准（导入配置等路�
     sources: [], seededBuiltInUrls: [], retiredBuiltInsV1: true,
   })
   assert.deepEqual(read().seededBuiltInUrls, [], '显式传空数组应当被尊重，不能被旧值盖回去')
+})
+
+// ---- 默认自定义订阅「网络分享」：新装 / 升级各播一次，作为普通自定义源出现，删了不复活 ----
+const isFromTheWeb = (s) => /\/from-the-web\/from-the-web\.m3u$/.test(s.subscriptionUrl || '')
+
+check('新装：「网络分享」和精选频道一起出现，是普通订阅源（不是内置订阅）', () => {
+  rmSync(P, { force: true })
+  const mgr = new ExternalSourceManager()
+  const web = mgr.sources.sources.filter(isFromTheWeb)
+  assert.equal(web.length, 1)
+  assert.equal(web[0].name, '网络分享')
+  assert.equal(web[0].mode, 'subscription')
+  assert.ok(web[0].id, '要有稳定 id，配置档才能按源筛')
+  assert.deepEqual(read().seededDefaultSubscriptions, [DEFAULT_URL])
+})
+
+check('升级：老配置里没有 → 补一次，排在最后', () => {
+  write({
+    enabled: true, includeInPlaylists: true, updateOnStartup: true,
+    sources: [{ name: '我自己的源', mode: 'direct', enabled: true, m3u8Url: 'http://x/y.m3u8', id: 'aaaa1111' }],
+    seededBuiltInUrls: [BUILT_IN_URL], retiredBuiltInsV1: true,
+  })
+  const names = new ExternalSourceManager().sources.sources.map(s => s.name)
+  assert.deepEqual(names, ['我自己的源', '网络分享'])
+})
+
+check('升级：自己加过（任何写法）→ 只记账，不重复加', () => {
+  write({
+    enabled: true, includeInPlaylists: true, updateOnStartup: true,
+    sources: [{ name: '海外', mode: 'subscription', enabled: true, id: 'cccc3333',
+      subscriptionUrl: 'https://raw.githubusercontent.com/akiralereal/iptv/refs/heads/main/from-the-web/from-the-web.m3u' }],
+    seededBuiltInUrls: [BUILT_IN_URL], retiredBuiltInsV1: true,
+  })
+  new ExternalSourceManager()
+  const after = read()
+  assert.deepEqual(after.sources.map(s => s.name), ['网络分享'], '旧名称应迁移，不能再多一条')
+  assert.equal(after.sources[0].id, 'cccc3333', '改名不能换源 ID')
+  assert.deepEqual(after.seededDefaultSubscriptions, [DEFAULT_URL])
+})
+
+check('已播种的旧名称升级：只改名称，保留关闭状态、代理、刷新和已缓存频道', () => {
+  for (const name of ['海外', '来源于网络']) {
+    const source = { name, mode: 'subscription', enabled: false, id: 'dddd4444', useProxy: true,
+      subscriptionUrl: 'https://ghfast.top/https://raw.githubusercontent.com/akiralereal/iptv/refs/heads/main/from-the-web/from-the-web.m3u?version=1',
+      updateOnStartup: false, autoRefresh: false, refreshInterval: 90,
+      parsedChannels: [{ name: '原频道', url: 'https://example.com/live.m3u8' }] }
+    write({ sources: [source], seededBuiltInUrls: [BUILT_IN_URL],
+      seededDefaultSubscriptions: [DEFAULT_URL], retiredBuiltInsV1: true })
+    new ExternalSourceManager()
+    assert.deepEqual(read().sources, [{ ...source, name: '网络分享' }])
+    assert.equal(read().networkShareNameV1, true)
+  }
+})
+
+check('改名范围：保留其他自定义名称，不改同路径的其他仓库订阅', () => {
+  const sources = [
+    { id: 'eeee5555', name: '我的港澳台', mode: 'subscription', subscriptionUrl: DEFAULT_URL, updateOnStartup: true },
+    { id: 'ffff6666', name: '海外', mode: 'subscription', subscriptionUrl: 'https://raw.githubusercontent.com/another/repo/main/from-the-web/from-the-web.m3u', updateOnStartup: true },
+  ]
+  write({ sources, seededBuiltInUrls: [BUILT_IN_URL], seededDefaultSubscriptions: [DEFAULT_URL], retiredBuiltInsV1: true })
+  new ExternalSourceManager()
+  assert.deepEqual(read().sources, sources)
+})
+
+check('改名仅执行一次：后台保存保留迁移标记，用户随后改回旧名也不会被重写', () => {
+  write({ sources: [{ id: 'aaaa7777', name: '海外', mode: 'subscription', subscriptionUrl: DEFAULT_URL }],
+    seededBuiltInUrls: [BUILT_IN_URL], seededDefaultSubscriptions: [DEFAULT_URL], retiredBuiltInsV1: true })
+  const mgr = new ExternalSourceManager()
+  const copy = asFrontendCopy(read())
+  copy.sources[0].name = '海外'
+  mgr.saveSources(copy)
+  assert.equal(read().networkShareNameV1, true, '前端整份保存不能丢迁移标记')
+  assert.equal(new ExternalSourceManager().sources.sources[0].name, '海外')
+})
+
+check('旧数组配置也迁移名称且保留原 ID', () => {
+  write([{ id: 'bbbb8888', name: '海外', mode: 'subscription', subscriptionUrl: DEFAULT_URL }])
+  const matched = new ExternalSourceManager().sources.sources.filter(isFromTheWeb)
+  assert.equal(matched.length, 1)
+  assert.equal(matched[0].name, '网络分享')
+  assert.equal(matched[0].id, 'bbbb8888')
+})
+
+check('删掉「网络分享」→ 后台保存一次 → 重启，不复活', () => {
+  rmSync(P, { force: true })
+  const mgr = new ExternalSourceManager()
+  const copy = asFrontendCopy(read())
+  copy.sources = copy.sources.filter(s => !isFromTheWeb(s))
+  mgr.saveSources(copy)
+  assert.deepEqual(read().seededDefaultSubscriptions, [DEFAULT_URL], '保存把账本抹掉了')
+  const names = new ExternalSourceManager().sources.sources.map(s => s.name)
+  assert.ok(!names.includes('网络分享'), `删掉的复活了：${names.join(', ')}`)
 })
 
 rmSync(TMP, { recursive: true, force: true })

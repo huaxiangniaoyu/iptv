@@ -89,15 +89,16 @@ const programmesWith = (body, key = '1', extra = {}) => kankanewsEpg.programmes(
 
 console.log('看看新闻节目单测试')
 
-check('验签：取流详情的既有固定样本不变，节目单请求按排序串双 MD5', () => {
+check('验签：取流详情与节目单均使用官网 2.45.2，按排序串双 MD5', () => {
   assert.equal(apiSignedHeaders, buildSignedHeaders, 'api.js 照旧导出同一个验签函数')
   assert.equal(buildSignedHeaders({ channel_id: '2' }, { now: 1720000000000, nonce: 'abcd1234', uuid: FIXED.uuid }).sign,
-    '91365fae251585050ea90559bea0f3ea')
+    '3128fcbe0a188dbe4da6d255bd80628a')
   const headers = buildSignedHeaders({ channel_id: '1', date: '2026-09-25' }, FIXED)
   const canonical = 'Api-Version=v1&channel_id=1&date=2026-09-25&nonce=abcd1234&platform=pc'
-    + '&timestamp=1790267400&version=2.42.15&28c8edde3d61a0411511d3b1866f0636'
+    + '&timestamp=1790267400&version=2.45.2&28c8edde3d61a0411511d3b1866f0636'
   assert.equal(headers.sign, md5(md5(canonical)))
-  assert.equal(headers.sign, 'f4bd78b838080ca97c1d1bc7b6546047')
+  assert.equal(headers.sign, '33a6be33760e90147f4be5bae1b317b5')
+  assert.equal(headers.version, '2.45.2')
   assert.equal(headers.timestamp, 1790267400)
   assert.equal(headers['m-uuid'], FIXED.uuid)
 })
@@ -110,7 +111,7 @@ await checkAsync('请求：上海日期换成 YYYY-MM-DD，带固定签名、超
     fetchImpl: async (url, options) => { seen = { url, options }; return json(programsBody('1', '2026-09-25', DFWS_HEAD, DFWS_ROWS)) },
   })
   assert.equal(seen.url, `${EPG_API}?channel_id=1&date=2026-09-25`)
-  assert.equal(seen.options.headers.sign, 'f4bd78b838080ca97c1d1bc7b6546047')
+  assert.equal(seen.options.headers.sign, '33a6be33760e90147f4be5bae1b317b5')
   assert.equal(seen.options.headers.platform, 'pc')
   assert.equal(seen.options.redirect, 'manual')
   assert.ok(seen.options.signal instanceof AbortSignal)
@@ -198,15 +199,19 @@ await checkAsync('频道：每个登记的 ref 都是模块实际输出的频道
   assert.equal(module.epg, kankanewsEpg)
   assert.equal(module.capabilities.epg, true)
   assert.equal(kankanewsEpg.days, 2)
-  const list = await module.fetch({}, {
-    fetchImpl: async url => {
-      const { pathname } = new URL(url)
-      if (pathname === '/content/pc/tv/channels') return json({ code: '1000', result: { limit_time: 180, list: CHANNEL_ROWS } })
-      assert.equal(pathname, '/content/pc/news/detail')
-      return json({ code: '1000', result: { limit_time: 180, play_info: SCENIC_ROWS } })
-    },
-  })
-  const emitted = new Map(list.groups.flatMap(group => group.dataList).map(channel => [channel.deferredRef, channel.name]))
+  const fetchImpl = async url => {
+    const { pathname } = new URL(url)
+    if (pathname === '/content/pc/tv/channels') return json({ code: '1000', result: { limit_time: 180, list: CHANNEL_ROWS } })
+    assert.equal(pathname, '/content/pc/news/detail')
+    return json({ code: '1000', result: { limit_time: 180, play_info: SCENIC_ROWS } })
+  }
+  const list = await module.fetch({}, { fetchImpl })
+  // 景观拆成了「上海景观」模块（2026-11-08），它不挂节目单
+  const scenicModule = getModule('kankanews-scenic')
+  assert.equal(scenicModule.epg, undefined)
+  const scenicList = await scenicModule.fetch({}, { fetchImpl })
+  assert.equal(list.groups.flatMap(group => group.dataList).length, 8)
+  const emitted = new Map([...list.groups, ...scenicList.groups].flatMap(group => group.dataList).map(channel => [channel.deferredRef, channel.name]))
   assert.equal(emitted.size, 13)
   const mapped = kankanewsEpg.channels()
   for (const { ref, name, key } of mapped) {
